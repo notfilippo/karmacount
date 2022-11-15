@@ -696,11 +696,13 @@ name = "karmacount"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bincode",
  "chrono",
  "log",
  "openssl",
  "pretty_env_logger",
+ "serde",
  "sled",
  "teloxide",
  "thiserror",

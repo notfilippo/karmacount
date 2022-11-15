@@ -1,8 +1,5 @@
 use std::sync::Arc;
 
-use bincode::deserialize;
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use sled::Db;
 use teloxide::{
     adaptors::DefaultParseMode,
     requests::{Requester, ResponseResult},
@@ -11,7 +8,11 @@ use teloxide::{
     Bot,
 };
 
-use crate::{db, error::Error};
+use crate::{
+    business::{self, DEFAULT_DOWN, DEFAULT_UP},
+    db::Store,
+    error::Error,
+};
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
@@ -24,45 +25,24 @@ pub enum UserCommand {
 
 async fn handler(
     bot: DefaultParseMode<Bot>,
-    db: Arc<Db>,
+    db: Arc<Store>,
     msg: Message,
     cmd: UserCommand,
 ) -> Result<(), Error> {
     match cmd {
         UserCommand::Start | UserCommand::Stats => {
             if let Some(sender) = msg.from() {
-                let db_up = db.open_tree(db::TREE_UP)?;
-                let db_down = db.open_tree(db::TREE_DOWN)?;
-                let db_karma = db.open_tree(db::TREE_KARMA)?;
-                let db_last = db.open_tree(db::TREE_LAST)?;
+                let current_last = db.last.get_or(sender.id.to_string(), 0)?;
+                let expired = business::is_assignable_karma_expired(current_last);
 
-                let current_last = db_last
-                    .get(sender.id.to_string())?
-                    .map_or(Ok(db::DEFAULT_LAST), |bytes| deserialize(&bytes))?;
+                let karma = db.karma.get_or(sender.id.to_string(), 0)?;
 
-                let now = Utc::now();
-                let then =
-                    DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(current_last, 0), Utc);
-
-                let midnight = (then + Duration::days(1)).date().and_hms(0, 0, 0);
-                let expired = now.gt(&midnight);
-
-                let karma = db_karma
-                    .get(sender.id.to_string())?
-                    .map_or(Ok(db::DEFAULT_KARMA), |bytes| deserialize(&bytes))?;
-
-                let up = match expired {
-                    true => db::DEFAULT_UP,
-                    false => db_up
-                        .get(sender.id.to_string())?
-                        .map_or(Ok(db::DEFAULT_UP), |bytes| deserialize(&bytes))?,
-                };
-
-                let down = match expired {
-                    true => db::DEFAULT_DOWN,
-                    false => db_down
-                        .get(sender.id.to_string())?
-                        .map_or(Ok(db::DEFAULT_DOWN), |bytes| deserialize(&bytes))?,
+                let (up, down) = match expired {
+                    true => (DEFAULT_UP, DEFAULT_DOWN),
+                    false => (
+                        db.up.get_or(sender.id.to_string(), DEFAULT_UP)?,
+                        db.down.get_or(sender.id.to_string(), DEFAULT_DOWN)?,
+                    ),
                 };
 
                 let text = format!(
@@ -82,7 +62,7 @@ async fn handler(
 
 pub async fn command_handler(
     bot: DefaultParseMode<Bot>,
-    db: Arc<Db>,
+    db: Arc<Store>,
     msg: Message,
     cmd: UserCommand,
 ) -> ResponseResult<()> {

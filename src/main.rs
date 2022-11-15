@@ -1,3 +1,4 @@
+mod business;
 mod db;
 mod error;
 mod telegram;
@@ -20,33 +21,38 @@ async fn main() -> anyhow::Result<()> {
 
     let bot = Bot::new(token).parse_mode(ParseMode::Html);
 
-    let db = Arc::new(sled::open(DB_PATH)?);
+    let db = sled::open(DB_PATH)?;
+    let store = Arc::new(db::Store::new(&db)?);
 
-    let handler = Update::filter_message()
+    let handler = dptree::entry()
+        .branch(Update::filter_callback_query().endpoint(message::callback_handler))
         .branch(
-            dptree::filter(|root: UserId, msg: Message| {
-                msg.from().map(|user| user.id == root).unwrap_or(false)
-            })
-            .filter_command::<root_command::RootCommand>()
-            .endpoint(root_command::command_handler),
-        )
-        .branch(
-            dptree::filter(|msg: Message| msg.chat.is_private())
-                .filter_command::<user_command::UserCommand>()
-                .endpoint(user_command::command_handler),
-        )
-        .branch(
-            dptree::filter(|msg: Message| msg.chat.is_group() || msg.chat.is_supergroup())
-                .filter_command::<group_command::GroupCommand>()
-                .endpoint(group_command::command_handler),
-        )
-        .branch(
-            dptree::filter(|msg: Message| msg.chat.is_group() || msg.chat.is_supergroup())
-                .endpoint(message::message_handler),
+            Update::filter_message()
+                .branch(
+                    dptree::filter(|root: UserId, msg: Message| {
+                        msg.from().map(|user| user.id == root).unwrap_or(false)
+                    })
+                    .filter_command::<root_command::RootCommand>()
+                    .endpoint(root_command::command_handler),
+                )
+                .branch(
+                    dptree::filter(|msg: Message| msg.chat.is_private())
+                        .filter_command::<user_command::UserCommand>()
+                        .endpoint(user_command::command_handler),
+                )
+                .branch(
+                    dptree::filter(|msg: Message| msg.chat.is_group() || msg.chat.is_supergroup())
+                        .filter_command::<group_command::GroupCommand>()
+                        .endpoint(group_command::command_handler),
+                )
+                .branch(
+                    dptree::filter(|msg: Message| msg.chat.is_group() || msg.chat.is_supergroup())
+                        .endpoint(message::message_handler),
+                ),
         );
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![root, db])
+        .dependencies(dptree::deps![root, store])
         .enable_ctrlc_handler()
         .build()
         .dispatch()

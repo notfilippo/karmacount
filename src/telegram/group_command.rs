@@ -1,16 +1,14 @@
 use std::{collections::HashSet, sync::Arc};
 
-use bincode::{deserialize, serialize};
-use sled::Db;
 use teloxide::{
     adaptors::DefaultParseMode,
     requests::{Requester, ResponseResult},
-    types::{Message, MessageId, UserId},
+    types::Message,
     utils::command::BotCommands,
     Bot,
 };
 
-use crate::{db, error::Error};
+use crate::{db::Store, error::Error};
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
@@ -21,16 +19,13 @@ pub enum GroupCommand {
 
 async fn handler(
     bot: DefaultParseMode<Bot>,
-    db: Arc<Db>,
+    db: Arc<Store>,
     msg: Message,
     cmd: GroupCommand,
 ) -> Result<(), Error> {
     match cmd {
         GroupCommand::Leaderboard => {
-            let db_members = db.open_tree(db::TREE_MEMBERS)?;
-            let members = db_members
-                .get(msg.chat.id.to_string())?
-                .map_or(Ok(HashSet::<UserId>::new()), |bytes| deserialize(&bytes))?;
+            let members = db.members.get_or(msg.chat.id.to_string(), HashSet::new())?;
 
             if members.len() == 0 {
                 let text = "<i>There are no members with karma in this group.</i>";
@@ -38,15 +33,10 @@ async fn handler(
                 return Ok(());
             }
 
-            let db_karma = db.open_tree(db::TREE_KARMA)?;
-            let db_last_message = db.open_tree(db::TREE_LAST_MESSAGE)?;
-
             let mut leaderboard = members
                 .iter()
                 .map(|id| {
-                    let karma = db_karma
-                        .get(id.to_string())?
-                        .map_or(Ok(db::DEFAULT_KARMA), |bytes| deserialize(&bytes))?;
+                    let karma = db.karma.get_or(id.to_string(), 0)?;
                     Ok((id, karma))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -66,16 +56,12 @@ async fn handler(
             }
 
             let last_message_key = format!("{}-leaderboard", msg.chat.id);
-            let last_message: Option<MessageId> = db_last_message
-                .get(&last_message_key)?
-                .map_or(Ok(None), |bytes| deserialize(&bytes).map(|id| Some(id)))?;
-
-            if let Some(last_message) = last_message {
+            if let Some(last_message) = db.last_message.get(&last_message_key)? {
                 bot.delete_message(msg.chat.id, last_message).await.ok();
             }
 
             let message = bot.send_message(msg.chat.id, text).await?;
-            db_last_message.insert(&last_message_key, serialize(&message.id)?)?;
+            db.last_message.insert(&last_message_key, message.id)?;
         }
     };
 
@@ -84,7 +70,7 @@ async fn handler(
 
 pub async fn command_handler(
     bot: DefaultParseMode<Bot>,
-    db: Arc<Db>,
+    db: Arc<Store>,
     msg: Message,
     cmd: GroupCommand,
 ) -> ResponseResult<()> {

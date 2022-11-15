@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use sled::Db;
 use teloxide::{
     adaptors::DefaultParseMode,
     requests::{Requester, ResponseResult},
@@ -9,7 +8,7 @@ use teloxide::{
     Bot,
 };
 
-use crate::{db, error::Error};
+use crate::{db::Store, error::Error};
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
@@ -24,20 +23,18 @@ pub enum RootCommand {
 
 async fn handler(
     bot: DefaultParseMode<Bot>,
-    db: Arc<Db>,
+    db: Arc<Store>,
     root: UserId,
     msg: Message,
     cmd: RootCommand,
 ) -> Result<(), Error> {
     match cmd {
         RootCommand::Reset(user) => {
-            let db_last = db.open_tree(db::TREE_LAST)?;
-            db_last.remove(user.to_string())?;
+            db.last.remove(user.to_string())?;
             bot.send_message(root, "Reset complete.").await?;
         }
         RootCommand::ResetAll => {
-            let db_last = db.open_tree(db::TREE_LAST)?;
-            db_last.clear()?;
+            db.last.clear()?;
             bot.send_message(root, "Reset complete.").await?;
         }
         RootCommand::Info => {
@@ -63,7 +60,7 @@ async fn handler(
 
 pub async fn command_handler(
     bot: DefaultParseMode<Bot>,
-    db: Arc<Db>,
+    db: Arc<Store>,
     root: UserId,
     msg: Message,
     cmd: RootCommand,

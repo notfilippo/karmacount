@@ -1,18 +1,23 @@
 use std::{collections::HashSet, fmt::Display, str::FromStr, sync::Arc};
 
 use bincode::{deserialize, serialize};
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use sled::Db;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use teloxide::{
     adaptors::DefaultParseMode,
+    payloads::{AnswerCallbackQuerySetters, SendMessageSetters},
     requests::{Requester, ResponseResult},
-    types::{Message, MessageId, UserId},
+    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, UserId},
     Bot,
 };
 
-use crate::{db, error::Error};
+use crate::{
+    business::{self, DEFAULT_DOWN, DEFAULT_UP},
+    db::Store,
+    error::Error,
+};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Karma {
     Up,
     Down,
@@ -41,83 +46,82 @@ impl FromStr for Karma {
     }
 }
 
-async fn handler(bot: DefaultParseMode<Bot>, db: Arc<Db>, msg: Message) -> Result<(), Error> {
+async fn message_handler_internal(
+    bot: DefaultParseMode<Bot>,
+    db: Arc<Store>,
+    msg: Message,
+) -> Result<(), Error> {
     if let Some(Ok(modifier)) = msg.text().map(|text| Karma::from_str(text)) {
         if let Some(reply) = msg.reply_to_message() {
             if let (Some(giver), Some(receiver)) = (msg.from(), reply.from()) {
                 if !giver.is_bot && !receiver.is_bot && giver.id != receiver.id {
-                    let db_up = db.open_tree(db::TREE_UP)?;
-                    let db_down = db.open_tree(db::TREE_DOWN)?;
-                    let db_karma = db.open_tree(db::TREE_KARMA)?;
-                    let db_last = db.open_tree(db::TREE_LAST)?;
-                    let db_last_message = db.open_tree(db::TREE_LAST_MESSAGE)?;
-                    let db_members = db.open_tree(db::TREE_MEMBERS)?;
+                    let last_karma_timestamp = db.last.get_or(&giver.id.to_string(), 0)?;
 
-                    let current_last = db_last
-                        .get(giver.id.to_string())?
-                        .map_or(Ok(db::DEFAULT_LAST), |bytes| deserialize(&bytes))?;
-
-                    let now = Utc::now();
-                    let then = DateTime::<Utc>::from_utc(
-                        NaiveDateTime::from_timestamp(current_last, 0),
-                        Utc,
-                    );
-
-                    let midnight = (then + Duration::days(1)).date().and_hms(0, 0, 0);
-                    let expired = now.gt(&midnight);
-
-                    if expired {
-                        db_up.remove(giver.id.to_string())?;
-                        db_down.remove(giver.id.to_string())?;
+                    if business::is_assignable_karma_expired(last_karma_timestamp) {
+                        db.up.remove(giver.id.to_string())?;
+                        db.down.remove(giver.id.to_string())?;
                     }
 
                     let (db_available, default_available) = match modifier {
-                        Karma::Up => (&db_up, db::DEFAULT_UP),
-                        Karma::Down => (&db_down, db::DEFAULT_DOWN),
+                        Karma::Up => (&db.up, DEFAULT_UP),
+                        Karma::Down => (&db.down, DEFAULT_DOWN),
                     };
 
-                    let available_current = db_available
-                        .get(giver.id.to_string())?
-                        .map_or(Ok(default_available), |bytes| deserialize(&bytes))?;
+                    let available_current =
+                        db_available.get_or(giver.id.to_string(), default_available)?;
 
                     if available_current < 1 {
+                        let keyboard_text =
+                            format!("use my karma as {} for {}", modifier, receiver.full_name());
+                        let keyboard = InlineKeyboardMarkup::default().append_row(vec![
+                            InlineKeyboardButton::callback(
+                                keyboard_text,
+                                base64::encode(&serialize(&(modifier.clone(), receiver.id))?),
+                            ),
+                        ]);
+
                         let text = format!("<i>no more {} points available today</i>", modifier);
-                        bot.send_message(msg.chat.id, text).await?;
+
+                        let last_message_key = format!("{}-status", msg.chat.id);
+                        if let Some(last_message) = db.last_message.get(&last_message_key)? {
+                            bot.delete_message(msg.chat.id, last_message).await.ok();
+                        }
+
+                        let update_message = bot
+                            .send_message(msg.chat.id, text)
+                            .reply_markup(keyboard)
+                            .await?;
+
+                        db.last_message
+                            .insert(&last_message_key, update_message.id)?;
+
                         return Ok(());
                     }
 
                     let available = available_current - 1;
+                    db_available.insert(giver.id.to_string(), available)?;
 
-                    let karma_current = db_karma
-                        .get(receiver.id.to_string())?
-                        .map_or(Ok(db::DEFAULT_KARMA), |bytes| deserialize(&bytes))?;
+                    let timestamp = Utc::now().naive_utc().timestamp();
+                    db.last.insert(giver.id.to_string(), timestamp)?;
+
+                    let karma_current = db.karma.get_or(receiver.id.to_string(), 0)?;
 
                     let karma = match modifier {
                         Karma::Up => karma_current + 1,
                         Karma::Down => karma_current - 1,
                     };
 
-                    let timestamp = now.naive_utc().timestamp();
-                    db_last.insert(giver.id.to_string(), serialize(&timestamp)?)?;
-                    db_available.insert(giver.id.to_string(), serialize(&available)?)?;
-                    db_karma.insert(receiver.id.to_string(), serialize(&karma)?)?;
+                    db.karma.insert(receiver.id.to_string(), karma)?;
 
-                    let mut members = db_members
-                        .get(msg.chat.id.to_string())?
-                        .map_or(Ok(HashSet::<UserId>::new()), |bytes| deserialize(&bytes))?;
+                    let mut members = db.members.get_or(msg.chat.id.to_string(), HashSet::new())?;
 
                     members.insert(giver.id);
                     members.insert(receiver.id);
 
-                    db_members.insert(msg.chat.id.to_string(), serialize(&members)?)?;
+                    db.members.insert(msg.chat.id.to_string(), members)?;
 
                     let last_message_key = format!("{}-{}", msg.chat.id, receiver.id);
-                    let last_message: Option<MessageId> =
-                        db_last_message
-                            .get(&last_message_key)?
-                            .map_or(Ok(None), |bytes| deserialize(&bytes).map(|id| Some(id)))?;
-
-                    if let Some(last_message) = last_message {
+                    if let Some(last_message) = db.last_message.get(&last_message_key)? {
                         bot.delete_message(msg.chat.id, last_message).await.ok();
                     }
 
@@ -128,7 +132,8 @@ async fn handler(bot: DefaultParseMode<Bot>, db: Arc<Db>, msg: Message) -> Resul
                     );
 
                     let update_message = bot.send_message(msg.chat.id, text).await?;
-                    db_last_message.insert(&last_message_key, serialize(&update_message.id)?)?;
+                    db.last_message
+                        .insert(&last_message_key, update_message.id)?;
                 }
             }
         }
@@ -139,10 +144,97 @@ async fn handler(bot: DefaultParseMode<Bot>, db: Arc<Db>, msg: Message) -> Resul
 
 pub async fn message_handler(
     bot: DefaultParseMode<Bot>,
-    db: Arc<Db>,
+    db: Arc<Store>,
     msg: Message,
 ) -> ResponseResult<()> {
-    match handler(bot, db, msg).await {
+    match message_handler_internal(bot, db, msg).await {
+        Ok(_) => Ok(()),
+        Err(e) => match e {
+            Error::DatabaseError(err) => {
+                log::error!("Database error: {}", err);
+                Ok(())
+            }
+            Error::DecodingError(err) => {
+                log::error!("Decoding error: {}", err);
+                Ok(())
+            }
+            Error::TelegramError(err) => Err(err),
+        },
+    }
+}
+
+async fn callback_handler_internal(
+    bot: DefaultParseMode<Bot>,
+    db: Arc<Store>,
+    cq: CallbackQuery,
+) -> Result<(), Error> {
+    if let Some(data) = cq.data {
+        let giver = cq.from;
+        let (modifier, receiver_id): (Karma, UserId) = deserialize(&base64::decode(data).unwrap())?;
+
+        let karma_giver_current = db.karma.get_or(giver.id.to_string(), 0)?;
+
+        if karma_giver_current < 1 {
+            bot.answer_callback_query(cq.id)
+                .text("not enough karma")
+                .await?;
+            return Ok(());
+        }
+
+        let karma_receiver_current = db.karma.get_or(receiver_id.to_string(), 0)?;
+
+        let karma_receiver = match modifier {
+            Karma::Up => karma_receiver_current + 1,
+            Karma::Down => karma_receiver_current - 1,
+        };
+
+        let karma_giver = karma_giver_current - 1;
+
+        db.karma.insert(receiver_id.to_string(), karma_receiver)?;
+        db.karma.insert(giver.id.to_string(), karma_giver)?;
+
+        bot.answer_callback_query(cq.id).text("thanks!").await?;
+
+        if let Some(msg) = cq.message {
+            let last_message_key = format!("{}-{}", msg.chat.id, receiver_id);
+            if let Some(last_message) = db.last_message.get(&last_message_key)? {
+                bot.delete_message(msg.chat.id, last_message).await.ok();
+            }
+
+            let receiver_chat = bot.get_chat(receiver_id).await?;
+            let receiver_name = receiver_chat
+                .username()
+                .map(|username| format!("@{}", username))
+                .unwrap_or(receiver_chat.first_name().unwrap_or("N/A").to_string());
+            let receiver_mention = format!(
+                "<a href=\"tg://user?id={}\">{}</a>",
+                receiver_id, receiver_name
+            );
+
+            let text = format!(
+                "{} reputation of {} ({})\n\
+                <i>thanks to {} ({})</i>",
+                modifier,
+                receiver_mention,
+                karma_receiver,
+                giver.mention().unwrap_or(giver.full_name()),
+                karma_giver
+            );
+
+            bot.edit_message_text(msg.chat.id, msg.id, text).await?;
+            db.last_message.insert(&last_message_key, msg.id)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn callback_handler(
+    bot: DefaultParseMode<Bot>,
+    db: Arc<Store>,
+    cq: CallbackQuery,
+) -> ResponseResult<()> {
+    match callback_handler_internal(bot, db, cq).await {
         Ok(_) => Ok(()),
         Err(e) => match e {
             Error::DatabaseError(err) => {
