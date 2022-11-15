@@ -11,6 +11,7 @@ use teloxide::{
     Bot,
 };
 
+use super::mention_chat;
 use crate::{
     business::{self, DEFAULT_DOWN, DEFAULT_UP},
     db::Store,
@@ -172,15 +173,6 @@ async fn callback_handler_internal(
         let giver = cq.from;
         let (modifier, receiver_id): (Karma, UserId) = deserialize(&base64::decode(data).unwrap())?;
 
-        let karma_giver_current = db.karma.get_or(giver.id.to_string(), 0)?;
-
-        if karma_giver_current < 1 {
-            bot.answer_callback_query(cq.id)
-                .text("not enough karma")
-                .await?;
-            return Ok(());
-        }
-
         let karma_receiver_current = db.karma.get_or(receiver_id.to_string(), 0)?;
 
         let karma_receiver = match modifier {
@@ -188,10 +180,43 @@ async fn callback_handler_internal(
             Karma::Down => karma_receiver_current - 1,
         };
 
-        let karma_giver = karma_giver_current - 1;
+        let last_karma_timestamp = db.last.get_or(&giver.id.to_string(), 0)?;
+
+        if business::is_assignable_karma_expired(last_karma_timestamp) {
+            db.up.remove(giver.id.to_string())?;
+            db.down.remove(giver.id.to_string())?;
+        }
+
+        let (db_available, default_available) = match modifier {
+            Karma::Up => (&db.up, DEFAULT_UP),
+            Karma::Down => (&db.down, DEFAULT_DOWN),
+        };
+
+        let available_current = db_available.get_or(giver.id.to_string(), default_available)?;
+        if available_current < 1 {
+            let karma_giver_current = db.karma.get_or(giver.id.to_string(), 0)?;
+            if karma_giver_current < 1 {
+                bot.answer_callback_query(cq.id)
+                    .text("not enough karma")
+                    .await?;
+                return Ok(());
+            }
+
+            let karma_giver = karma_giver_current - 1;
+            db.karma.insert(giver.id.to_string(), karma_giver)?;
+        } else {
+            let available = available_current - 1;
+            db_available.insert(giver.id.to_string(), available)?;
+        }
+
+        let karma_giver = db.karma.get_or(giver.id.to_string(), 0)?;
+
+        let source = match available_current < 1 {
+            true => "karma",
+            false => "points",
+        };
 
         db.karma.insert(receiver_id.to_string(), karma_receiver)?;
-        db.karma.insert(giver.id.to_string(), karma_giver)?;
 
         bot.answer_callback_query(cq.id).text("thanks!").await?;
 
@@ -202,22 +227,16 @@ async fn callback_handler_internal(
             }
 
             let receiver_chat = bot.get_chat(receiver_id).await?;
-            let receiver_name = receiver_chat
-                .username()
-                .map(|username| format!("@{}", username))
-                .unwrap_or(receiver_chat.first_name().unwrap_or("N/A").to_string());
-            let receiver_mention = format!(
-                "<a href=\"tg://user?id={}\">{}</a>",
-                receiver_id, receiver_name
-            );
+            let receiver_mention = mention_chat(&receiver_chat);
 
             let text = format!(
                 "{} reputation of {} ({})\n\
-                <i>thanks to {} ({})</i>",
+                <i>thanks to {}'s {} ({})</i>",
                 modifier,
                 receiver_mention,
                 karma_receiver,
                 giver.mention().unwrap_or(giver.full_name()),
+                source,
                 karma_giver
             );
 

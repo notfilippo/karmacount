@@ -8,6 +8,7 @@ use teloxide::{
     Bot,
 };
 
+use super::mention_chat;
 use crate::{db::Store, error::Error};
 
 #[derive(BotCommands, Clone)]
@@ -46,11 +47,7 @@ async fn handler(
             let mut text = String::new();
             for (i, (id, karma)) in leaderboard.iter().enumerate() {
                 let chat = bot.get_chat(**id).await?;
-                let name = chat
-                    .username()
-                    .map(|username| format!("@{}", username))
-                    .unwrap_or(chat.first_name().unwrap_or("N/A").to_string());
-                let mention = format!("<a href=\"tg://user?id={}\">{}</a>", id, name);
+                let mention = mention_chat(&chat);
                 text.push_str(&format!("{}. {} : {}", i + 1, mention, karma));
                 text.push('\n');
             }
