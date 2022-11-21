@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use teloxide::{
     adaptors::DefaultParseMode,
     requests::{Requester, ResponseResult},
@@ -8,7 +9,7 @@ use teloxide::{
     Bot,
 };
 
-use crate::{db::Store, error::Error};
+use crate::db::Store;
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
@@ -27,7 +28,7 @@ async fn handler(
     root: UserId,
     msg: Message,
     cmd: RootCommand,
-) -> Result<(), Error> {
+) -> Result<()> {
     match cmd {
         RootCommand::Reset(user) => {
             db.last.remove(user.to_string())?;
@@ -42,11 +43,9 @@ async fn handler(
                 if let Some(user) = reply.from() {
                     let text = format!(
                         "User info {}: \n\
-                                - ID: {}\n\
-                                - Username: {}",
+                                - ID: {}",
                         user.full_name(),
                         user.id,
-                        user.username.clone().unwrap_or("N/A".to_string())
                     );
                     bot.send_message(root, text).await?;
                     bot.delete_message(msg.chat.id, msg.id).await.ok();
@@ -67,16 +66,12 @@ pub async fn command_handler(
 ) -> ResponseResult<()> {
     match handler(bot, db, root, msg, cmd).await {
         Ok(_) => Ok(()),
-        Err(e) => match e {
-            Error::DatabaseError(err) => {
-                log::error!("Database error: {}", err);
+        Err(err) => match err.downcast::<teloxide::RequestError>() {
+            Ok(err) => Err(err),
+            Err(err) => {
+                log::error!("Generic error: {}", err);
                 Ok(())
             }
-            Error::DecodingError(err) => {
-                log::error!("Decoding error: {}", err);
-                Ok(())
-            }
-            Error::TelegramError(err) => Err(err),
         },
     }
 }

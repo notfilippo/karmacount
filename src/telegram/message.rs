@@ -1,5 +1,6 @@
 use std::{collections::HashSet, fmt::Display, str::FromStr, sync::Arc};
 
+use anyhow::Result;
 use bincode::{deserialize, serialize};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -11,11 +12,10 @@ use teloxide::{
     Bot,
 };
 
-use super::mention_chat;
+use super::{mention_chat, mention_user};
 use crate::{
-    business::{self, DEFAULT_DOWN, DEFAULT_UP},
-    db::Store,
-    error::Error,
+    business::{self, DEFAULT_DOWN, DEFAULT_UP, GRAPH_MAX_SIZE},
+    db::{Measure, Store},
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -51,12 +51,12 @@ async fn message_handler_internal(
     bot: DefaultParseMode<Bot>,
     db: Arc<Store>,
     msg: Message,
-) -> Result<(), Error> {
-    if let Some(Ok(modifier)) = msg.text().map(|text| Karma::from_str(text)) {
+) -> Result<()> {
+    if let Some(Ok(modifier)) = msg.text().map(Karma::from_str) {
         if let Some(reply) = msg.reply_to_message() {
             if let (Some(giver), Some(receiver)) = (msg.from(), reply.from()) {
                 if !giver.is_bot && !receiver.is_bot && giver.id != receiver.id {
-                    let last_karma_timestamp = db.last.get_or(&giver.id.to_string(), 0)?;
+                    let last_karma_timestamp = db.last.get_or(giver.id.to_string(), 0)?;
 
                     if business::is_assignable_karma_expired(last_karma_timestamp) {
                         db.up.remove(giver.id.to_string())?;
@@ -77,7 +77,7 @@ async fn message_handler_internal(
                         let keyboard = InlineKeyboardMarkup::default().append_row(vec![
                             InlineKeyboardButton::callback(
                                 keyboard_text,
-                                base64::encode(&serialize(&(modifier.clone(), receiver.id))?),
+                                base64::encode(serialize(&(modifier.clone(), receiver.id))?),
                             ),
                         ]);
 
@@ -102,7 +102,7 @@ async fn message_handler_internal(
                     let available = available_current - 1;
                     db_available.insert(giver.id.to_string(), available)?;
 
-                    let timestamp = Utc::now().naive_utc().timestamp();
+                    let timestamp = Utc::now().timestamp();
                     db.last.insert(giver.id.to_string(), timestamp)?;
 
                     let karma_current = db.karma.get_or(receiver.id.to_string(), 0)?;
@@ -111,6 +111,17 @@ async fn message_handler_internal(
                         Karma::Up => karma_current + 1,
                         Karma::Down => karma_current - 1,
                     };
+
+                    let mut graph = db.graph.get_or(receiver.id.to_string(), vec![])?;
+                    graph.push(Measure::new(karma));
+
+                    if graph.len() > GRAPH_MAX_SIZE {
+                        let diff = graph.len() - GRAPH_MAX_SIZE;
+                        db.graph
+                            .insert(receiver.id.to_string(), graph[diff..].to_vec())?;
+                    } else {
+                        db.graph.insert(receiver.id.to_string(), graph)?;
+                    }
 
                     db.karma.insert(receiver.id.to_string(), karma)?;
 
@@ -126,11 +137,7 @@ async fn message_handler_internal(
                         bot.delete_message(msg.chat.id, last_message).await.ok();
                     }
 
-                    let text = format!(
-                        "reputation of {} ({})",
-                        receiver.mention().unwrap_or(receiver.full_name()),
-                        karma
-                    );
+                    let text = format!("reputation of {} ({})", mention_user(receiver), karma);
 
                     let update_message = bot.send_message(msg.chat.id, text).await?;
                     db.last_message
@@ -150,16 +157,12 @@ pub async fn message_handler(
 ) -> ResponseResult<()> {
     match message_handler_internal(bot, db, msg).await {
         Ok(_) => Ok(()),
-        Err(e) => match e {
-            Error::DatabaseError(err) => {
-                log::error!("Database error: {}", err);
+        Err(err) => match err.downcast::<teloxide::RequestError>() {
+            Ok(err) => Err(err),
+            Err(err) => {
+                log::error!("Generic error: {}", err);
                 Ok(())
             }
-            Error::DecodingError(err) => {
-                log::error!("Decoding error: {}", err);
-                Ok(())
-            }
-            Error::TelegramError(err) => Err(err),
         },
     }
 }
@@ -168,7 +171,7 @@ async fn callback_handler_internal(
     bot: DefaultParseMode<Bot>,
     db: Arc<Store>,
     cq: CallbackQuery,
-) -> Result<(), Error> {
+) -> Result<()> {
     if let Some(data) = cq.data {
         let giver = cq.from;
         let (modifier, receiver_id): (Karma, UserId) = deserialize(&base64::decode(data).unwrap())?;
@@ -180,7 +183,7 @@ async fn callback_handler_internal(
             Karma::Down => karma_receiver_current - 1,
         };
 
-        let last_karma_timestamp = db.last.get_or(&giver.id.to_string(), 0)?;
+        let last_karma_timestamp = db.last.get_or(giver.id.to_string(), 0)?;
 
         if business::is_assignable_karma_expired(last_karma_timestamp) {
             db.up.remove(giver.id.to_string())?;
@@ -235,7 +238,7 @@ async fn callback_handler_internal(
                 modifier,
                 receiver_mention,
                 karma_receiver,
-                giver.mention().unwrap_or(giver.full_name()),
+                mention_user(&giver),
                 source,
                 karma_giver
             );
@@ -255,16 +258,12 @@ pub async fn callback_handler(
 ) -> ResponseResult<()> {
     match callback_handler_internal(bot, db, cq).await {
         Ok(_) => Ok(()),
-        Err(e) => match e {
-            Error::DatabaseError(err) => {
-                log::error!("Database error: {}", err);
+        Err(err) => match err.downcast::<teloxide::RequestError>() {
+            Ok(err) => Err(err),
+            Err(err) => {
+                log::error!("Generic error: {}", err);
                 Ok(())
             }
-            Error::DecodingError(err) => {
-                log::error!("Decoding error: {}", err);
-                Ok(())
-            }
-            Error::TelegramError(err) => Err(err),
         },
     }
 }

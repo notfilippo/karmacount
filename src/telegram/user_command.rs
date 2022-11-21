@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use teloxide::{
     adaptors::DefaultParseMode,
     requests::{Requester, ResponseResult},
@@ -11,7 +12,6 @@ use teloxide::{
 use crate::{
     business::{self, DEFAULT_DOWN, DEFAULT_UP},
     db::Store,
-    error::Error,
 };
 
 #[derive(BotCommands, Clone)]
@@ -28,7 +28,7 @@ async fn handler(
     db: Arc<Store>,
     msg: Message,
     cmd: UserCommand,
-) -> Result<(), Error> {
+) -> Result<()> {
     match cmd {
         UserCommand::Start | UserCommand::Stats => {
             if let Some(sender) = msg.from() {
@@ -68,16 +68,12 @@ pub async fn command_handler(
 ) -> ResponseResult<()> {
     match handler(bot, db, msg, cmd).await {
         Ok(_) => Ok(()),
-        Err(e) => match e {
-            Error::DatabaseError(err) => {
-                log::error!("Database error: {}", err);
+        Err(err) => match err.downcast::<teloxide::RequestError>() {
+            Ok(err) => Err(err),
+            Err(err) => {
+                log::error!("Generic error: {}", err);
                 Ok(())
             }
-            Error::DecodingError(err) => {
-                log::error!("Decoding error: {}", err);
-                Ok(())
-            }
-            Error::TelegramError(err) => Err(err),
         },
     }
 }

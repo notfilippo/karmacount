@@ -1,6 +1,5 @@
 mod business;
 mod db;
-mod error;
 mod telegram;
 
 use std::{env, sync::Arc};
@@ -22,6 +21,12 @@ async fn main() -> anyhow::Result<()> {
     let bot = Bot::new(token).parse_mode(ParseMode::Html);
 
     let db = sled::open(DB_PATH)?;
+    if db.was_recovered() {
+        log::info!("Database was recovered");
+    } else {
+        log::warn!("Database was created");
+    }
+
     let store = Arc::new(db::Store::new(&db)?);
 
     let handler = dptree::entry()
